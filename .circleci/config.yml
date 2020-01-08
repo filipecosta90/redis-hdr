@@ -1,0 +1,162 @@
+version: 2.1
+
+commands:
+  ci_steps:
+    parameters:
+      platform:
+        type: string
+    steps:
+      - checkout
+      - run:
+          name: Pull Submodules
+          command: make fetch
+      - run:
+          name: Install prerequisites
+          command: make setup
+      - run:
+          name: Build
+          command: make build SHOW=1
+      - run:
+          name: Test
+          command: >-
+            mkdir -p /workspace/tests;
+            make test TEST_REPORT_DIR=/workspace/tests SHOW=1
+      - run:
+          name: Package
+          command: make pack BRANCH="${CIRCLE_BRANCH//[^A-Za-z0-9._-]/_}" INTO=/workspace/packages SHOW=1
+      - persist_to_workspace:
+          root: /workspace
+          paths:
+            - 'packages/release/*.zip'
+            - 'packages/branch/*.zip'
+      - store_test_results:
+          path: /workspace/tests
+  deploy:
+    parameters:
+      from:
+        type: string
+    steps:
+      - run:
+          name: Deploy to S3
+          command: >-
+            aws s3 cp <<parameters.from>>/ s3://redismodules/$PACKAGE_NAME/ --acl public-read --recursive --exclude "*" --include "*.zip"
+
+jobs:
+  build:
+    docker:
+      - image: 'redislabsmodules/rmbuilder:latest'
+    steps:
+      - ci_steps:
+          platform: debian 
+  build-macos:
+    macos:
+      xcode: 10.2.1
+    steps:
+      - run:
+          name: Set up workspace
+          command: |
+            sudo mkdir -p /workspace
+            sudo chown $USER /workspace
+      - ci_steps:
+          platform: macosx
+  build-multiarch-docker:
+    machine:
+      enabled: true
+      image: ubuntu-1604:201903-01
+    steps:
+      - checkout
+      - run:
+          name: Setup Docker client experimental features
+          command: |
+            sudo ./deps/readies/bin/getdocker --just-enable-exp
+            docker version
+      - run:
+          name: Build
+          command: |
+            sudo docker login -u redisfab -p $DOCKER_REDISFAB_PWD
+            make -C build/docker build
+            sudo make -C build/docker publish
+
+  deploy_package:
+    parameters:
+      package:
+        type: string
+    docker:
+      - image: 'redislabsmodules/rmbuilder:latest'
+    steps:
+      - attach_workspace:
+          at: /workspace
+      - deploy:
+          from: /workspace/packages/<<parameters.package>>
+      - store_artifacts:
+          path: /workspace/packages/<<parameters.package>>
+
+  deploy_docs:
+    docker:
+      - image: 'redislabsmodules/rmbuilder:latest'
+    steps:
+      - checkout
+      - run:
+          name: Build Docs
+          command: mkdocs build
+      - run:
+          name: Deploy Docs to S3
+          command: >-
+            aws s3 cp site s3://oss.redislabs.com/$WEBSITE_FOLDER/ --acl public-read --recursive
+
+  run_automation:
+    docker:
+      - image: 'redislabsmodules/rmbuilder:latest'
+    steps:
+      - run:
+          name: Run QA Automation
+          command: >-
+            apt-get update && apt-get install -y curl &&
+            curl -f -k -u $QA_AUTOMATION_USERNAME:$QA_AUTOMATION_PASS -X POST
+            -H "Content-Type: application/json"
+            -d '{"service_id":"single_module_test_cycle_sanity_and_extended", "name":"redistimeseries automation-testing", "properties":{"sut_version":"master", "email_recipients":"t9b6i7v6e2q3d0s4@redislabs.slack.com", "sut_environments":[], "tools_environment":{}, "module_name": "RedisTS", "module_version":"master", "cycle_environments_setup":[{"teardown":true, "name":"xenial-amd64-aws", "concurrency":1}, {"teardown":true, "name":"bionic-amd64-aws", "concurrency":1}]}}'
+            https://qa-automation-center.redislabs.com/processes
+
+workflows:
+  version: 2
+  build_and_package:
+    jobs:
+      - build:
+          filters:
+            tags:
+              only: /.*/
+      - build-macos:
+          filters:
+            tags:
+              only: /.*/
+      - build-multiarch-docker:
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              only: master
+      - deploy_package:
+          name: deploy_branch
+          package: branch
+          requires:
+            - build
+          filters:
+            branches:
+              only: master
+      - deploy_package:
+          name: deploy_release
+          package: release
+          requires:
+            - build
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: '/^v[0-9].*/'
+      - run_automation:
+          requires:
+            - deploy_branch
+      - deploy_docs:
+          filters:
+            branches:
+              only: master
